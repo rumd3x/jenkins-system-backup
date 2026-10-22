@@ -1,5 +1,6 @@
 // Docker-focused restore pipeline: downloads a selected Docker backup from NAS storage, copies every
-// volume/bind mount back to its original location on the target host over SCP, uploads the compose
+// volume/bind mount back to its original location on the target host with rsync (ownership comes from
+// xattrs written by the backup), uploads the compose
 // file and starts all containers. The target must already have docker and docker compose working.
 // Runs a script (read from stdin) on TARGET_HOST over SSH with a working `sudo` even though the session
 // has no TTY: the SSH password is sent as the first stdin line and fed to `sudo -S` by a shell function.
@@ -8,14 +9,50 @@ def RSH = '''
 SUDO_PRELUDE='if [ "$(id -u)" = 0 ]; then sudo() { "$@"; }; else sudo() { printf "%s\\n" "$SUDO_PASS" | command sudo -S -p "" "$@"; }; fi'
 REMOTE_WRAPPER="sh -c 'IFS= read -r SUDO_PASS; eval \\"\\$(cat)\\"'"
 rsh() {
+    # every arg is single-quoted (embedded quotes escaped) before it reaches the remote shell
     RSH_ARGS=""
-    for a in "$@"; do RSH_ARGS="${RSH_ARGS} '${a}'"; done
+    for a in "$@"; do
+        esc=$(printf '%s' "$a" | sed "s/'/'\\\\\\\\''/g")
+        RSH_ARGS="${RSH_ARGS} '${esc}'"
+    done
     {
         printf '%s\\n' "${SSH_PASS}"
         printf '%s\\n' "${SUDO_PRELUDE}"
         printf '%s\\n' "set -- ${RSH_ARGS}"
         cat
     } | sshpass -e ssh ${SSH_OPTS} "${SSH_USER}@${REMOTE_HOST}" "${REMOTE_WRAPPER}"
+}
+
+# rsync owns the SSH stdin, so `sudo -S` cannot be used for the remote `sudo rsync`. Instead sudo gets an askpass
+# helper kept in a private (mode 700) temp dir on the target, removed on exit by the trap rsync_setup installs. Sets ASKPASS_DIR and RSYNC_PATH.
+rsync_setup() {
+    command -v rsync > /dev/null || { echo "rsync is required on the Jenkins agent" >&2; return 1; }
+    INFO=$(rsh <<'SETUP'
+set -eu
+command -v rsync > /dev/null || { echo "rsync is required on the target host" >&2; exit 1; }
+umask 077
+d=$(mktemp -d /var/tmp/rsync-work.XXXXXX)
+printf '%s\\n' "$SUDO_PASS" > "$d/pw"
+printf '#!/bin/sh\\ncat "%s/pw"\\n' "$d" > "$d/askpass"
+chmod 700 "$d/askpass"
+echo "$d"
+id -u
+SETUP
+)
+    ASKPASS_DIR=$(echo "${INFO}" | sed -n 1p)
+    # also clean up when the build is aborted (SIGTERM/SIGINT), not just on normal exit
+    trap 'exit 1' INT TERM HUP
+    trap rsync_cleanup EXIT
+    if [ "$(echo "${INFO}" | sed -n 2p)" = 0 ]; then
+        RSYNC_PATH="rsync"
+    else
+        RSYNC_PATH="SUDO_ASKPASS=${ASKPASS_DIR}/askpass sudo -A rsync"
+    fi
+}
+rsync_cleanup() {
+    if [ -n "${ASKPASS_DIR:-}" ]; then
+        echo 'rm -rf "$1"' | rsh "${ASKPASS_DIR}" || true
+    fi
 }
 '''
 
@@ -64,6 +101,23 @@ pipeline {
 
     stages {
 
+        // Parameters end up in shell commands and paths on three machines: reject anything but plain values
+        stage('Validate Parameters') {
+            steps {
+                script {
+                    if (!(params.TARGET_HOST ==~ /^[A-Za-z0-9][A-Za-z0-9._-]*$/)) {
+                        error "TARGET_HOST must be a hostname or IPv4 address (letters, digits, '.', '_', '-')"
+                    }
+                    if (!(params.NAS_HOST ==~ /^[A-Za-z0-9][A-Za-z0-9._-]*$/)) {
+                        error "NAS_HOST must be a hostname or IPv4 address (letters, digits, '.', '_', '-')"
+                    }
+                    if (!(params.BACKUP_PATH ==~ /^\/[A-Za-z0-9._\/+@=-]+$/)) {
+                        error "BACKUP_PATH must be an absolute path without spaces or shell characters"
+                    }
+                }
+            }
+        }
+
         // Pauses the pipeline with a human-approval prompt listing all available backups
         stage('Select Backup from NAS') {
             steps {
@@ -75,15 +129,14 @@ pipeline {
                     )]) {
                         def rawList = sh(
                             script: '''
-                                sshpass -p "${NAS_PASS}" ssh -o StrictHostKeyChecking=no \
-                                    ${NAS_USER}@${NAS_HOST} \
-                                    "ls -1 ${NAS_PATH}"
+                                export SSHPASS="${NAS_PASS}"
+                                sshpass -e ssh ${SSH_OPTS} ${NAS_USER}@${NAS_HOST} "ls -1 ${NAS_PATH}"
                             ''',
                             returnStdout: true
                         ).trim()
 
                         // filter to entries matching the YYYY_MM_DD-<host> naming pattern
-                        def backupList = rawList.split('\n').findAll { it.trim() =~ /^\d{4}_\d{2}_\d{2}-/ }
+                        def backupList = rawList.split('\n').findAll { it.trim() ==~ /^\d{4}_\d{2}_\d{2}-[A-Za-z0-9._-]+$/ }
 
                         if (backupList.isEmpty()) {
                             error "No backup directories found on NAS at ${env.NAS_PATH}"
@@ -114,10 +167,12 @@ pipeline {
                     passwordVariable: 'NAS_PASS'
                 )]) {
                     sh '''
-                        sshpass -p "${NAS_PASS}" scp -o StrictHostKeyChecking=no \
-                            -o ServerAliveInterval=60 -o ServerAliveCountMax=10 -r \
-                            ${NAS_USER}@${NAS_HOST}:${NAS_PATH}/${SELECTED_BACKUP} \
-                            "${SELECTED_BACKUP}"
+                        command -v rsync > /dev/null || { echo "rsync is required on the Jenkins agent" >&2; exit 1; }
+                        export SSHPASS="${NAS_PASS}"
+                        # --fake-super on both ends: the NAS stores ownership/special-file info in xattrs
+                        rsync -aHXs --numeric-ids --fake-super -e "sshpass -e ssh ${SSH_OPTS}" \
+                            --rsync-path="rsync --fake-super" \
+                            "${NAS_USER}@${NAS_HOST}:${NAS_PATH}/${SELECTED_BACKUP}" .
                     '''
                 }
             }
@@ -129,8 +184,7 @@ pipeline {
                 sh '''
                     echo "Verifying backup integrity..."
                     TAB=$(printf '\\t')
-                    SEP=$(printf '\\001')
-                    for f in docker-compose.yaml mounts.tsv networks.tsv ownership.tsv; do
+                    for f in docker-compose.yaml mounts.tsv networks.tsv; do
                         if [ ! -e "${SELECTED_BACKUP}/${f}" ]; then
                             echo "ERROR: ${f} is missing from the backup"
                             exit 1
@@ -139,15 +193,23 @@ pipeline {
                     test -s "${SELECTED_BACKUP}/docker-compose.yaml"
                     grep -q '^services:' "${SELECTED_BACKUP}/docker-compose.yaml"
 
+                    # mounts.tsv decides where root writes on the target: refuse malformed or dangerous entries
                     while IFS="${TAB}" read -r type name src kind dir; do
+                        case "${type}" in bind|volume) ;; *) echo "ERROR: invalid mount type '${type}'"; exit 1 ;; esac
+                        case "${kind}" in d|f) ;; *) echo "ERROR: invalid kind '${kind}'"; exit 1 ;; esac
+                        case "${src}" in
+                            /|/proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/run|/run/*|/var/run|/var/run/*) echo "ERROR: refusing to restore to '${src}'"; exit 1 ;;
+                            /*) ;;
+                            *) echo "ERROR: mount source must be absolute: '${src}'"; exit 1 ;;
+                        esac
+                        case "${dir}" in
+                            */../*|*/..) echo "ERROR: invalid backup folder '${dir}'"; exit 1 ;;
+                            volumes/*|binds/*) ;;
+                            *) echo "ERROR: invalid backup folder '${dir}'"; exit 1 ;;
+                        esac
                         if [ ! -e "${SELECTED_BACKUP}/${dir}" ]; then
                             echo "ERROR: ${dir} is missing from the backup"
                             exit 1
-                        fi
-                        expected=$(awk -F"${SEP}" -v d="${dir}" '$1==d && ($5=="f" || $5=="d")' "${SELECTED_BACKUP}/ownership.tsv" | wc -l)
-                        actual=$(find "${SELECTED_BACKUP}/${dir}" \\( -type f -o -type d \\) | wc -l)
-                        if [ "${expected}" -ne "${actual}" ]; then
-                            echo "WARNING: ${dir}: expected ${expected} entries, found ${actual}"
                         fi
                     done < "${SELECTED_BACKUP}/mounts.tsv"
                     echo "Backup integrity OK"
@@ -192,7 +254,7 @@ EOF
             }
         }
 
-        // For each mount: SCP the folder to a temp dir on the target, copy it into place with sudo, re-apply ownership
+        // For each mount: resolve the destination and rsync the folder there with `sudo rsync` (root applies ownership)
         stage('Restore Volumes and Mounts') {
             steps {
                 withCredentials([usernamePassword(
@@ -203,70 +265,35 @@ EOF
                     sh(RSH + '''
                         export SSHPASS="${SSH_PASS}"
                         TAB=$(printf '\\t')
-                        SEP=$(printf '\\001')
                         TARGET="${SSH_USER}@${REMOTE_HOST}"
 
-                        cleanup() {
-                            echo 'sudo rm -rf "$1"' | rsh "$1" || true
-                        }
+                        rsync_setup
 
                         while IFS="${TAB}" read -r type name src kind dir; do
                             echo "Restoring ${dir} -> ${src}"
-                            # /var/tmp instead of /tmp: /tmp is often a RAM-backed tmpfs
-                            STAGE=$(echo 'mktemp -d /var/tmp/restore-stage.XXXXXX' | rsh)
 
-                            # manifest entries of this mount only, with the leading folder column removed
-                            awk -F"${SEP}" -v d="${dir}" -v s="${SEP}" \
-                                'index($0, d s) == 1 { print substr($0, length(d) + 2) }' \
-                                "${SELECTED_BACKUP}/ownership.tsv" > own.tsv
-
-                            sshpass -e scp ${SSH_OPTS} -r "${SELECTED_BACKUP}/${dir}" "${TARGET}:${STAGE}/data" < /dev/null \
-                                || { cleanup "${STAGE}"; exit 1; }
-                            sshpass -e scp ${SSH_OPTS} own.tsv "${TARGET}:${STAGE}/own.tsv" < /dev/null \
-                                || { cleanup "${STAGE}"; exit 1; }
-
-                            rsh "${type}" "${name}" "${src}" "${kind}" "${STAGE}" <<'EOF' || { cleanup "${STAGE}"; exit 1; }
-# the restore logic runs as one root shell (a single sudo) because it may touch many files
-cat > "$5/root.sh" <<'ROOT'
+                            # compose declares named volumes as external, so they must exist; the mountpoint is resolved by docker
+                            DEST=$(rsh "${type}" "${name}" "${src}" "${kind}" <<'EOF'
 set -eu
-type=$1; name=$2; dest=$3; kind=$4; stage=$5
-SEP=$(printf '\\001')
-
-# compose declares named volumes as external, so they must exist; the mountpoint is resolved by docker
+type=$1; name=$2; dest=$3; kind=$4
 if [ "$type" = volume ]; then
-    docker volume inspect "$name" > /dev/null 2>&1 || docker volume create "$name" > /dev/null
-    dest=$(docker volume inspect --format '{{.Mountpoint}}' "$name")
+    sudo docker volume inspect "$name" > /dev/null 2>&1 || sudo docker volume create "$name" > /dev/null
+    dest=$(sudo docker volume inspect --format '{{.Mountpoint}}' "$name")
 fi
-
-if [ "$kind" = d ]; then
-    mkdir -p "$dest"
-    cp -a "$stage/data/." "$dest/"
-else
-    mkdir -p "$(dirname "$dest")"
-    cp -f "$stage/data" "$dest"
-fi
-
-# SCP cannot carry ownership/permissions, so they are re-applied from the manifest (chown before chmod: chown clears suid/sgid)
-while IFS="$SEP" read -r uid gid mode ftype link rel; do
-    if [ -n "$rel" ]; then p="$dest/$rel"; else p="$dest"; fi
-    case "$ftype" in
-        l)
-            ln -sfn "$link" "$p"
-            chown -h "$uid:$gid" "$p"
-            ;;
-        f|d)
-            if [ -e "$p" ]; then
-                chown "$uid:$gid" "$p"
-                chmod "$mode" "$p"
-            fi
-            ;;
-    esac
-done < "$stage/own.tsv"
-
-rm -rf "$stage"
-ROOT
-sudo sh "$5/root.sh" "$1" "$2" "$3" "$4" "$5"
+if [ "$kind" = d ]; then sudo mkdir -p "$dest"; else sudo mkdir -p "$(dirname "$dest")"; fi
+echo "$dest"
 EOF
+)
+
+                            if [ "${kind}" = d ]; then
+                                FROM="${SELECTED_BACKUP}/${dir}/"; TO="${TARGET}:${DEST}/"
+                            else
+                                FROM="${SELECTED_BACKUP}/${dir}"; TO="${TARGET}:${DEST}"
+                            fi
+
+                            # The sender (this agent) reads the real uid/gid/mode and symlink/special-file info from xattrs
+                            # (--fake-super); the receiver is root on the target, so it applies them for real
+                            rsync -aHXs --numeric-ids --fake-super -e "sshpass -e ssh ${SSH_OPTS}" --rsync-path="${RSYNC_PATH}" "${FROM}" "${TO}" < /dev/null
                         done < "${SELECTED_BACKUP}/mounts.tsv"
                     ''')
                 }
