@@ -14,6 +14,10 @@ No agents to install on the target. No special software. Just SSH.
 
 **Restore** (`restore.groovy`) — Lists available backups on your NAS, asks you to pick one, verifies it, and streams it back onto any target host. The machine reboots automatically when done.
 
+### Docker edition
+
+Running everything in Docker? **`backup-docker.groovy`** and **`restore-docker.groovy`** take the same parameters but skip the full-system archive: they generate a compose file that recreates all your containers and copy just their volumes and bind mounts. Restore to any host that already has Docker and Compose — no reboot, no tarballs.
+
 ---
 
 ## What you need
