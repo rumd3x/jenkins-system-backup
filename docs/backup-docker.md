@@ -23,7 +23,7 @@ YYYY_MM_DD-<host>/
 
 ## Parameters
 
-Identical to v1. Values are validated by the first stage (see below) because they end up in shell commands and paths on three machines.
+Same as v1 except `CHUNK_SIZE`, which is removed (nothing is compressed or split). Values are validated by the first stage (see below) because they end up in shell commands and paths on three machines.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -33,7 +33,6 @@ Identical to v1. Values are validated by the first stage (see below) because the
 | `NAS_SSH_CREDENTIAL` | credentials | — | `UsernamePassword` credential for SSH access to the NAS |
 | `BACKUP_PATH` | string | — | Absolute directory path on the NAS where backups will be stored (no spaces or shell characters); created if missing |
 | `DAYS_TO_KEEP` | string | `7` | Maximum number of backup directories to retain per host before the oldest are deleted. Must be a positive integer |
-| `CHUNK_SIZE` | string | `2G` | **Unused in the Docker variant** (nothing is compressed or split). Kept so v1 job configurations keep working |
 
 ---
 

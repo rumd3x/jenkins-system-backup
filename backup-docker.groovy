@@ -106,13 +106,6 @@ pipeline {
             trim: true,
             description: 'Maximum number of backup files to retain per host before oldest are deleted'
         )
-        // Kept for parameter compatibility with v1; the Docker variant does not compress or chunk the backup
-        string(
-            name: 'CHUNK_SIZE',
-            defaultValue: '2G',
-            trim: true,
-            description: 'Unused in the Docker variant (volumes are copied as-is). Kept for compatibility with v1'
-        )
     }
 
     environment {
