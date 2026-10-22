@@ -10,7 +10,7 @@
 
 Both pipelines run on a Docker-labeled Jenkins agent and use `sshpass`/`scp` for SSH access. Credentials are managed through the Jenkins Credentials store.
 
-- **`backup-docker.groovy`** — Docker-only variant of the backup. Uses `red5d/docker-autocompose:latest` on the target to generate a compose file for all containers, then copies every volume/bind mount uncompressed via SCP (staged through a sudo copy, with an `ownership.tsv` manifest). Same parameters, NAS upload and rotation as v1. The backup folder holds `docker-compose.yaml`, manifests and the mount folders instead of `part.*` chunks.
+- **`backup-docker.groovy`** — Docker-only variant of the backup. Uses `ghcr.io/red5d/docker-autocompose:latest` on the target to generate a compose file for all containers, then copies every volume/bind mount uncompressed via SCP (staged through a sudo copy, with an `ownership.tsv` manifest). Same parameters, NAS upload and rotation as v1. The backup folder holds `docker-compose.yaml`, manifests and the mount folders instead of `part.*` chunks.
 
 - **`restore-docker.groovy`** — Docker-only variant of the restore. Assumes Docker/Compose on the target; creates networks and named volumes, copies mounts back to their original paths, re-applies ownership, uploads the compose file and runs it. No reboot.
 

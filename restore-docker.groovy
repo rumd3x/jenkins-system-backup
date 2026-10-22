@@ -1,6 +1,24 @@
 // Docker-focused restore pipeline: downloads a selected Docker backup from NAS storage, copies every
 // volume/bind mount back to its original location on the target host over SCP, uploads the compose
 // file and starts all containers. The target must already have docker and docker compose working.
+// Runs a script (read from stdin) on TARGET_HOST over SSH with a working `sudo` even though the session
+// has no TTY: the SSH password is sent as the first stdin line and fed to `sudo -S` by a shell function.
+// Usage inside an sh step: rsh [script args...] <<'EOF' ... EOF
+def RSH = '''
+SUDO_PRELUDE='if [ "$(id -u)" = 0 ]; then sudo() { "$@"; }; else sudo() { printf "%s\\n" "$SUDO_PASS" | command sudo -S -p "" "$@"; }; fi'
+REMOTE_WRAPPER="sh -c 'IFS= read -r SUDO_PASS; eval \\"\\$(cat)\\"'"
+rsh() {
+    RSH_ARGS=""
+    for a in "$@"; do RSH_ARGS="${RSH_ARGS} '${a}'"; done
+    {
+        printf '%s\\n' "${SSH_PASS}"
+        printf '%s\\n' "${SUDO_PRELUDE}"
+        printf '%s\\n' "set -- ${RSH_ARGS}"
+        cat
+    } | sshpass -e ssh ${SSH_OPTS} "${SSH_USER}@${REMOTE_HOST}" "${REMOTE_WRAPPER}"
+}
+'''
+
 pipeline {
     agent { label 'docker' }
 
@@ -145,19 +163,19 @@ pipeline {
                     usernameVariable: 'SSH_USER',
                     passwordVariable: 'SSH_PASS'
                 )]) {
-                    sh '''
+                    sh(RSH + '''
                         export SSHPASS="${SSH_PASS}"
                         TAB=$(printf '\\t')
                         TARGET="${SSH_USER}@${REMOTE_HOST}"
 
                         # fixed directory name keeps the compose project name stable across restores
-                        sshpass -e ssh ${SSH_OPTS} "${TARGET}" "mkdir -p docker-restore" < /dev/null
+                        echo 'mkdir -p docker-restore' | rsh
                         sshpass -e scp ${SSH_OPTS} "${SELECTED_BACKUP}/docker-compose.yaml" \
                             "${TARGET}:docker-restore/docker-compose.yaml" < /dev/null
 
                         while IFS="${TAB}" read -r net driver subnet; do
                             echo "Ensuring network ${net}"
-                            sshpass -e ssh ${SSH_OPTS} "${TARGET}" "sh -s -- '${net}' '${driver}' '${subnet}'" <<'EOF'
+                            rsh "${net}" "${driver}" "${subnet}" <<'EOF'
 set -eu
 net=$1; driver=$2; subnet=$3
 if sudo docker network inspect "$net" > /dev/null 2>&1; then
@@ -169,7 +187,7 @@ else
 fi
 EOF
                         done < "${SELECTED_BACKUP}/networks.tsv"
-                    '''
+                    ''')
                 }
             }
         }
@@ -182,20 +200,20 @@ EOF
                     usernameVariable: 'SSH_USER',
                     passwordVariable: 'SSH_PASS'
                 )]) {
-                    sh '''
+                    sh(RSH + '''
                         export SSHPASS="${SSH_PASS}"
                         TAB=$(printf '\\t')
                         SEP=$(printf '\\001')
                         TARGET="${SSH_USER}@${REMOTE_HOST}"
 
                         cleanup() {
-                            sshpass -e ssh ${SSH_OPTS} "${TARGET}" "sudo rm -rf '$1'" < /dev/null || true
+                            echo 'sudo rm -rf "$1"' | rsh "$1" || true
                         }
 
                         while IFS="${TAB}" read -r type name src kind dir; do
                             echo "Restoring ${dir} -> ${src}"
                             # /var/tmp instead of /tmp: /tmp is often a RAM-backed tmpfs
-                            STAGE=$(sshpass -e ssh ${SSH_OPTS} "${TARGET}" "mktemp -d /var/tmp/restore-stage.XXXXXX" < /dev/null)
+                            STAGE=$(echo 'mktemp -d /var/tmp/restore-stage.XXXXXX' | rsh)
 
                             # manifest entries of this mount only, with the leading folder column removed
                             awk -F"${SEP}" -v d="${dir}" -v s="${SEP}" \
@@ -207,7 +225,9 @@ EOF
                             sshpass -e scp ${SSH_OPTS} own.tsv "${TARGET}:${STAGE}/own.tsv" < /dev/null \
                                 || { cleanup "${STAGE}"; exit 1; }
 
-                            sshpass -e ssh ${SSH_OPTS} "${TARGET}" "sudo sh -s -- '${type}' '${name}' '${src}' '${kind}' '${STAGE}'" <<'EOF' || { cleanup "${STAGE}"; exit 1; }
+                            rsh "${type}" "${name}" "${src}" "${kind}" "${STAGE}" <<'EOF' || { cleanup "${STAGE}"; exit 1; }
+# the restore logic runs as one root shell (a single sudo) because it may touch many files
+cat > "$5/root.sh" <<'ROOT'
 set -eu
 type=$1; name=$2; dest=$3; kind=$4; stage=$5
 SEP=$(printf '\\001')
@@ -244,9 +264,11 @@ while IFS="$SEP" read -r uid gid mode ftype link rel; do
 done < "$stage/own.tsv"
 
 rm -rf "$stage"
+ROOT
+sudo sh "$5/root.sh" "$1" "$2" "$3" "$4" "$5"
 EOF
                         done < "${SELECTED_BACKUP}/mounts.tsv"
-                    '''
+                    ''')
                 }
             }
         }
@@ -258,9 +280,9 @@ EOF
                     usernameVariable: 'SSH_USER',
                     passwordVariable: 'SSH_PASS'
                 )]) {
-                    sh '''
+                    sh(RSH + '''
                         export SSHPASS="${SSH_PASS}"
-                        sshpass -e ssh ${SSH_OPTS} "${SSH_USER}@${REMOTE_HOST}" 'sh -s' <<'EOF'
+                        rsh <<'EOF'
 set -eu
 cd docker-restore
 # supports both the compose v2 plugin and the standalone docker-compose binary
@@ -270,7 +292,7 @@ else
     sudo docker-compose -f docker-compose.yaml up -d
 fi
 EOF
-                    '''
+                    ''')
                 }
             }
         }

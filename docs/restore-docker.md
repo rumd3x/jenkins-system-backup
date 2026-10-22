@@ -65,7 +65,7 @@ Removes backup directories from the workspace and runs `cleanWs()` regardless of
 
 - Jenkins agent with label `docker`, with `sshpass` and `scp`
 - Target host with Docker and Docker Compose (plugin or standalone) already working
-- The SSH user on the target must be able to run `sudo docker`, `sudo docker compose`, `sudo cp`, `sudo chown`, `sudo chmod`, `sudo mkdir` and `sudo rm` without a password prompt (or be `root`)
+- The SSH user on the target must be `root` or a sudoer (the SSH password from `SSH_CREDENTIAL` is also used as the sudo password, or sudo may be passwordless)
 - Free space in `/var/tmp` on the target for a temporary copy of the **largest single mount**
 - The NAS must be accessible via SSH/SCP from the Jenkins agent
 
@@ -75,5 +75,6 @@ Removes backup directories from the workspace and runs `cleanWs()` regardless of
 
 - SSH host key checking is disabled (`-o StrictHostKeyChecking=no`). For production use, consider pre-populating the Jenkins agent's known hosts file instead.
 - Credentials are injected from the Jenkins Credentials store via `withCredentials`; SSH passwords are passed to `sshpass` through the `SSHPASS` environment variable rather than the command line.
+- Jenkins runs without a TTY, so `sudo` cannot prompt. Each remote script is streamed over SSH with the password as the first stdin line; a shell function wraps `sudo` as `sudo -S -p ''`, feeding it from a shell variable. The password never appears in a command line on either host. If the SSH user is `root`, `sudo` is bypassed.
 - **This pipeline overwrites files at the original mount paths and starts containers on the target.** Existing containers with the same names will conflict, and existing named volumes with the same names are merged into. Use a clean target and verify the selected backup before approving the input prompt.
 - Restored `docker-compose.yaml` contains the containers' environment variables, which may include secrets.

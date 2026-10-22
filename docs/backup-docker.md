@@ -46,7 +46,7 @@ Removes any stale backup directories in the Jenkins workspace left over from a p
 
 ### 2. Generate Compose File
 
-Computes the backup name (`YYYY_MM_DD-<host>`) into `env.BACKUP_NAME`, then SSHes into the target and runs `red5d/docker-autocompose:latest` (with the Docker socket mounted) against **every** container (`docker ps -a`, including stopped ones). The YAML written to stdout is saved as `docker-compose.yaml`. The stage fails if the host has no containers or the output has no `services:` section.
+Computes the backup name (`YYYY_MM_DD-<host>`) into `env.BACKUP_NAME`, then SSHes into the target and runs `ghcr.io/red5d/docker-autocompose:latest` (with the Docker socket mounted) against **every** container (`docker ps -a`, including stopped ones). The YAML written to stdout is saved as `docker-compose.yaml`. The image is pulled from GHCR (`ghcr.io/red5d/docker-autocompose`) because the Docker Hub copy is outdated and crashes with `KeyError: 'MacAddress'` on current Docker engines. The stage fails if the host has no containers or the output has no `services:` section.
 
 ### 3. Inspect Mounts and Networks
 
@@ -90,7 +90,7 @@ Same as v1: lists backup directories ending in `-<host>`, and if more than `DAYS
 ## Requirements
 
 - Jenkins agent with label `docker`, with `sshpass` and `scp`
-- Target host with Docker; the SSH user must be able to run `sudo docker`, `sudo find`, `sudo cp`, `sudo chown` and `sudo rm` without a password prompt (or be `root`), and must be able to pull `red5d/docker-autocompose:latest`
+- Target host with Docker; the SSH user must be `root` or a sudoer (the SSH password from `SSH_CREDENTIAL` is also used as the sudo password, or sudo may be passwordless), and the host must be able to pull `ghcr.io/red5d/docker-autocompose:latest`
 - Free space on the target (`/var/tmp`) for a temporary copy of the **largest single mount**, and on the Jenkins agent for the **entire backup** (nothing is compressed)
 - The NAS must be accessible via SSH/SCP from the Jenkins agent
 
@@ -109,5 +109,6 @@ Same as v1: lists backup directories ending in `-<host>`, and if more than `DAYS
 
 - SSH host key checking is disabled (`-o StrictHostKeyChecking=no`). For production use, consider pre-populating the Jenkins agent's known hosts file instead.
 - Credentials are injected from the Jenkins Credentials store via `withCredentials`; SSH passwords are passed to `sshpass` through the `SSHPASS` environment variable (`sshpass -e`) rather than the command line, and are never written to disk.
+- Jenkins runs without a TTY, so `sudo` cannot prompt. Each remote script is streamed over SSH with the password as the first stdin line; a shell function wraps `sudo` as `sudo -S -p ''`, feeding it from a shell variable. The password never appears in a command line on either host. If the SSH user is `root`, `sudo` is bypassed.
 - The backup contains the full container configuration, including **environment variables (which often hold secrets)** and unencrypted volume data. Restrict access to the NAS location accordingly.
 - The temporary copy on the target is owned by the SSH user for the duration of each mount's transfer.

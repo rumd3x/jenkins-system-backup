@@ -9,6 +9,25 @@
 //   ownership.tsv        uid/gid/mode of every copied entry, since SCP cannot preserve ownership
 //   volumes/<name>/      content of each named volume
 //   binds/<abs path>/    content of each bind mount
+
+// Runs a script (read from stdin) on TARGET_HOST over SSH with a working `sudo` even though the session
+// has no TTY: the SSH password is sent as the first stdin line and fed to `sudo -S` by a shell function.
+// Usage inside an sh step: rsh [script args...] <<'EOF' ... EOF
+def RSH = '''
+SUDO_PRELUDE='if [ "$(id -u)" = 0 ]; then sudo() { "$@"; }; else sudo() { printf "%s\\n" "$SUDO_PASS" | command sudo -S -p "" "$@"; }; fi'
+REMOTE_WRAPPER="sh -c 'IFS= read -r SUDO_PASS; eval \\"\\$(cat)\\"'"
+rsh() {
+    RSH_ARGS=""
+    for a in "$@"; do RSH_ARGS="${RSH_ARGS} '${a}'"; done
+    {
+        printf '%s\\n' "${SSH_PASS}"
+        printf '%s\\n' "${SUDO_PRELUDE}"
+        printf '%s\\n' "set -- ${RSH_ARGS}"
+        cat
+    } | sshpass -e ssh ${SSH_OPTS} "${SSH_USER}@${REMOTE_HOST}" "${REMOTE_WRAPPER}"
+}
+'''
+
 pipeline {
     agent { label 'docker' }
 
@@ -94,23 +113,24 @@ pipeline {
                     usernameVariable: 'SSH_USER',
                     passwordVariable: 'SSH_PASS'
                 )]) {
-                    sh '''
+                    sh(RSH + '''
                         export SSHPASS="${SSH_PASS}"
                         mkdir -p "${BACKUP_NAME}"
                         # stdout carries the YAML only; docker pull progress and errors go to stderr
-                        sshpass -e ssh ${SSH_OPTS} "${SSH_USER}@${REMOTE_HOST}" 'sh -s' > "${BACKUP_NAME}/docker-compose.yaml" <<'EOF'
+                        rsh > "${BACKUP_NAME}/docker-compose.yaml" <<'EOF'
 set -eu
 NAMES=$(sudo docker ps -a --format '{{.Names}}')
 if [ -z "$NAMES" ]; then
     echo "No containers found on the target host" >&2
     exit 1
 fi
-sudo docker run --rm -v /var/run/docker.sock:/var/run/docker.sock red5d/docker-autocompose:latest $NAMES
+# the Docker Hub image is stale and crashes on current Docker engines (KeyError: 'MacAddress'); GHCR is maintained
+sudo docker run --rm -v /var/run/docker.sock:/var/run/docker.sock ghcr.io/red5d/docker-autocompose:latest $NAMES
 EOF
                         grep -q '^services:' "${BACKUP_NAME}/docker-compose.yaml"
                         echo "Generated compose file:"
                         grep -c 'container_name:' "${BACKUP_NAME}/docker-compose.yaml" | sed 's/$/ container(s)/'
-                    '''
+                    ''')
                 }
             }
         }
@@ -123,11 +143,11 @@ EOF
                     usernameVariable: 'SSH_USER',
                     passwordVariable: 'SSH_PASS'
                 )]) {
-                    sh '''
+                    sh(RSH + '''
                         export SSHPASS="${SSH_PASS}"
 
                         # mounts.tsv: type <TAB> volume name (or -) <TAB> host source <TAB> kind (d=dir, f=file) <TAB> backup folder
-                        sshpass -e ssh ${SSH_OPTS} "${SSH_USER}@${REMOTE_HOST}" 'sh -s' > "${BACKUP_NAME}/mounts.tsv" <<'EOF'
+                        rsh > "${BACKUP_NAME}/mounts.tsv" <<'EOF'
 set -eu
 TAB=$(printf '\\t')
 IDS=$(sudo docker ps -aq)
@@ -148,7 +168,7 @@ done
 EOF
 
                         # networks.tsv: name <TAB> driver <TAB> subnet (or -). Internal networks are recreated by compose itself
-                        sshpass -e ssh ${SSH_OPTS} "${SSH_USER}@${REMOTE_HOST}" 'sh -s' > "${BACKUP_NAME}/networks.tsv" <<'EOF'
+                        rsh > "${BACKUP_NAME}/networks.tsv" <<'EOF'
 set -eu
 IDS=$(sudo docker ps -aq)
 OUT=$(sudo docker inspect --format '{{range $n, $v := .NetworkSettings.Networks}}{{$n}}{{"\\n"}}{{end}}' $IDS)
@@ -163,7 +183,7 @@ done
 EOF
                         echo "Mounts to back up:"
                         cat "${BACKUP_NAME}/mounts.tsv"
-                    '''
+                    ''')
                 }
             }
         }
@@ -176,14 +196,14 @@ EOF
                     usernameVariable: 'SSH_USER',
                     passwordVariable: 'SSH_PASS'
                 )]) {
-                    sh '''
+                    sh(RSH + '''
                         export SSHPASS="${SSH_PASS}"
                         TAB=$(printf '\\t')
                         SEP=$(printf '\\001')
                         TARGET="${SSH_USER}@${REMOTE_HOST}"
 
                         cleanup() {
-                            sshpass -e ssh ${SSH_OPTS} "${TARGET}" "sudo rm -rf '$1'" < /dev/null || true
+                            echo 'sudo rm -rf "$1"' | rsh "$1" || true
                         }
 
                         : > "${BACKUP_NAME}/ownership.tsv"
@@ -191,10 +211,10 @@ EOF
                         while IFS="${TAB}" read -r type name src kind dir; do
                             echo "Copying ${src} -> ${dir}"
                             # /var/tmp instead of /tmp: /tmp is often a RAM-backed tmpfs
-                            STAGE=$(sshpass -e ssh ${SSH_OPTS} "${TARGET}" "mktemp -d /var/tmp/backup-stage.XXXXXX" < /dev/null)
+                            STAGE=$(echo 'mktemp -d /var/tmp/backup-stage.XXXXXX' | rsh)
 
                             # stdout is the ownership manifest of the source; the script also fills ${STAGE}/data
-                            sshpass -e ssh ${SSH_OPTS} "${TARGET}" "sh -s -- '${src}' '${kind}' '${STAGE}' '${SSH_USER}'" > ownership.part <<'EOF' || { cleanup "${STAGE}"; exit 1; }
+                            rsh "${src}" "${kind}" "${STAGE}" "${SSH_USER}" > ownership.part <<'EOF' || { cleanup "${STAGE}"; exit 1; }
 set -eu
 src=$1; kind=$2; stage=$3; owner=$4
 SEP=$(printf '\\001')
@@ -220,7 +240,7 @@ EOF
                             awk -v d="${dir}" -v s="${SEP}" '{ print d s $0 }' ownership.part >> "${BACKUP_NAME}/ownership.tsv"
                             cleanup "${STAGE}"
                         done < "${BACKUP_NAME}/mounts.tsv"
-                    '''
+                    ''')
                 }
             }
         }
